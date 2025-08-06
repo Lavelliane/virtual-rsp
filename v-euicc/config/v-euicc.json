@@ -1,0 +1,36 @@
+{
+  "eid": "89049032000000000000000000000123",
+  "default_smdp_address": "testsmdpplus1.example.com",
+  "root_smds_address": "prod.smds.gsma.com",
+  "comm_method": 0,
+  "comm_address": "/tmp/v-euicc.sock",
+  "comm_port": 8765,
+  "debug_mode": true,
+  "storage_path": "./v-euicc/storage",
+  "certificate": {
+    "euicc": {
+      "type": "ecdsa_p256",
+      "cert_path": "./v-euicc/certs/euicc_cert.pem",
+      "private_key_path": "./v-euicc/certs/euicc_key.pem",
+      "ca_cert_path": "./v-euicc/certs/ca_cert.pem",
+      "pqc_enabled": false
+    },
+    "eum": {
+      "type": "ecdsa_p256",
+      "cert_path": "./v-euicc/certs/eum_cert.pem",
+      "private_key_path": "./v-euicc/certs/eum_key.pem",
+      "ca_cert_path": "./v-euicc/certs/ca_cert.pem",
+      "pqc_enabled": false
+    }
+  },
+  "profiles": {
+    "max_profiles": 8,
+    "allow_test_profiles": true,
+    "require_confirmation_code": false
+  },
+  "security": {
+    "enable_secure_channel": true,
+    "require_client_authentication": false,
+    "allowed_clients": ["lpac", "test"]
+  }
+} 
