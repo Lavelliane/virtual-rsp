@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./virtual.png" alt="Virtual eUICC Logo" width="220" />
+  <img src="./virtual.png" alt="Virtual eUICC Logo" width="500" />
 </p>
 
 # Virtual eUICC (v-euicc)
