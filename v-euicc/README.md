@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./virtual.png" alt="Virtual eUICC Logo" width="220" />
+</p>
+
 # Virtual eUICC (v-euicc)
 
 A software implementation of an eUICC (Embedded Universal Integrated Circuit Card) that conforms to the GSMA SGP.22 standard. This virtual eUICC eliminates the need for physical smart cards and PCSC readers when developing and testing eSIM applications.
