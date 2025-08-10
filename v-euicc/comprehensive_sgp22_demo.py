@@ -308,6 +308,11 @@ class ComprehensiveSGP22Demo:
     def start_smdp_server_detailed(self):
         """Start SM-DP+ server with detailed logging"""
         self.print_step(2, "Starting SM-DP+ Server with Authentication Endpoints")
+        # Allow using external SM-DP+ behind TLS reverse proxy (e.g., nginx)
+        if os.environ.get("EXTERNAL_SMDP") == "1":
+            print("🔧 EXTERNAL_SMDP=1 set: skipping local SM-DP+ startup (expect reverse proxy at https://testsmdpplus1.example.com:8443)")
+            self.log_test_result("SM-DP+ Server Startup", True, "Using external proxy")
+            return True
         
         pysim_dir = self.base_dir.parent / "pysim"
         venv_dir = pysim_dir / "venv"
@@ -327,14 +332,13 @@ class ComprehensiveSGP22Demo:
             self.log_test_result("SM-DP+ Server Startup", False, "Script not found")
             return False
         
-        # Start SM-DP+ server (using relative cert dir and no SSL for demo)
+        # Start SM-DP+ server with TLS (HTTPS)
         server_cmd = [
             str(venv_dir / "bin" / "python3"),
             "osmo-smdpp.py",
             "--host", self.smdp_host,
-            "--port", str(self.smdp_port),
-            "--certdir", "certs",
-            "--nossl"
+            "--port", str(self.smdp_tls_port),
+            "--certdir", "certs"
         ]
         
         print(f"🚀 Starting SM-DP+ server: {' '.join(server_cmd)}")
@@ -353,7 +357,7 @@ class ComprehensiveSGP22Demo:
         
         if self.smdp_process.poll() is None:
             print(f"✅ SM-DP+ server started (PID: {self.smdp_process.pid})")
-            print(f"   URL: http://{self.smdp_host}:{self.smdp_port}")
+            print(f"   URL: https://testsmdpplus1.example.com:{self.smdp_tls_port}")
             
             # Display startup logs
             print("\n📊 SM-DP+ Server Startup Logs:")
@@ -363,7 +367,9 @@ class ComprehensiveSGP22Demo:
             
             # Test server connectivity
             try:
-                response = requests.get(f"http://{self.smdp_host}:{self.smdp_port}/", timeout=5)
+                # Verify HTTPS listening by connecting to certificate hostname; requires hosts mapping
+                response = requests.get(f"https://testsmdpplus1.example.com:{self.smdp_tls_port}/",
+                                        timeout=5, verify=False)
                 print(f"✅ SM-DP+ server connectivity test: HTTP {response.status_code}")
                 self.log_test_result("SM-DP+ Server Startup", True, f"HTTP {response.status_code}")
                 return True
@@ -676,7 +682,11 @@ class ComprehensiveSGP22Demo:
         """Test SM-DP+ authentication endpoints"""
         print("🔍 Testing SM-DP+ Authentication Endpoints...")
         
-        base_url = f"http://{self.smdp_host}:{self.smdp_port}"
+        base_url = f"https://testsmdpplus1.example.com:{self.smdp_tls_port}"
+        
+        # Try to use the SM-DP+ TLS cert for verification when reachable
+        smdp_tls_cert = (self.base_dir.parent / "pysim" / "smdpp-data" / "certs" / "DPtls" / "CERT_S_SM_DP_TLS_NIST.pem")
+        verify_param = str(smdp_tls_cert) if smdp_tls_cert.exists() else False
         
         # Test ES9+ endpoints
         endpoints = [
@@ -688,7 +698,7 @@ class ComprehensiveSGP22Demo:
         for endpoint in endpoints:
             try:
                 # Test with GET first (should return 405 Method Not Allowed)
-                response = requests.get(f"{base_url}{endpoint}", timeout=5)
+                response = requests.get(f"{base_url}{endpoint}", timeout=5, verify=verify_param)
                 print(f"   {endpoint}: HTTP {response.status_code}")
                 
                 if response.status_code == 405:

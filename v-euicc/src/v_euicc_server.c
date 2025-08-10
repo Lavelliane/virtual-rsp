@@ -14,6 +14,10 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <getopt.h>
+#include <openssl/x509.h>
+#include <openssl/evp.h>
+#include <openssl/sha.h>
+#include <openssl/crypto.h>
 
 // Forward declaration
 static void log_apdu_detailed(const char *direction, const uint8_t *apdu, size_t length, const char *description);
@@ -23,6 +27,23 @@ static struct v_euicc_ctx g_ctx;
 static struct v_euicc_ecdsa_context g_crypto_ctx;
 static bool g_running = false;
 static int g_server_fd = -1;
+// Minimal ASN.1 length decoder (short/long form)
+static int asn1_decode_len_local(const uint8_t *buf, size_t buf_len, size_t *len_out, size_t *len_len) {
+    if (buf_len == 0) return -1;
+    uint8_t b0 = buf[0];
+    if ((b0 & 0x80) == 0) {
+        *len_out = b0;
+        *len_len = 1;
+        return 0;
+    }
+    size_t num = (size_t)(b0 & 0x7F);
+    if (num == 0 || num > sizeof(size_t) || 1 + num > buf_len) return -1;
+    size_t len = 0;
+    for (size_t i = 0; i < num; i++) len = (len << 8) | buf[1 + i];
+    *len_out = len;
+    *len_len = 1 + num;
+    return 0;
+}
 
 // Signal handler for graceful shutdown
 static void signal_handler(int signum) {
@@ -391,7 +412,7 @@ static int handle_client_message(int client_fd, struct v_euicc_message *message)
                             uint8_t *server_certificate = NULL;
                             size_t server_certificate_len = 0;
                             
-                            // Parse the request (simplified for now)
+                            // Parse the request (more complete parsing)
                             if (v_euicc_parse_authenticate_server_request(
                                 transmit_data->apdu + 5, transmit_data->apdu_length - 5,
                                 &server_signed1, &server_signed1_len,
@@ -403,16 +424,75 @@ static int handle_client_message(int client_fd, struct v_euicc_message *message)
                                     printf("AuthenticateServer: Parsed request successfully\n");
                                 }
                                 
-                                // Extract transaction ID and server challenge from serverSigned1
-                                // For now, use dummy values - in real implementation, parse from serverSigned1
-                                uint8_t dummy_transaction_id[] = {0x01, 0x02, 0x03, 0x04};
-                                uint8_t dummy_server_challenge[V_EUICC_CHALLENGE_LENGTH];
-                                v_euicc_generate_challenge(dummy_server_challenge);
+                                // Verify server certificate signature (serverSignature1 over serverSigned1)
+                                // 1) Load serverCertificate (DER) to X509
+                                const uint8_t *cert_ptr = server_certificate;
+                                X509 *server_x509 = d2i_X509(NULL, &cert_ptr, (long)server_certificate_len);
+                                if (!server_x509) {
+                                    if (g_ctx.config.debug_mode) printf("AuthenticateServer: Invalid server certificate\n");
+                                    apdu_response[0] = 0x6A; apdu_response[1] = 0x80; response_len = 2; goto auth_cleanup;
+                                }
+                                // Extract pubkey
+                                EVP_PKEY *server_pub = X509_get_pubkey(server_x509);
+                                if (!server_pub) {
+                                    X509_free(server_x509);
+                                    if (g_ctx.config.debug_mode) printf("AuthenticateServer: Failed to extract server pubkey\n");
+                                    apdu_response[0] = 0x6A; apdu_response[1] = 0x80; response_len = 2; goto auth_cleanup;
+                                }
+                                // Convert TR-03111 signature to DER
+                                uint8_t *der_sig = NULL; size_t der_sig_len = 0;
+                                if (v_euicc_tr03111_to_der(server_signature1, server_signature1_len, &der_sig, &der_sig_len) != 0) {
+                                    EVP_PKEY_free(server_pub); X509_free(server_x509);
+                                    if (g_ctx.config.debug_mode) printf("AuthenticateServer: Failed to convert signature format\n");
+                                    apdu_response[0] = 0x6A; apdu_response[1] = 0x80; response_len = 2; goto auth_cleanup;
+                                }
+                                // Verify signature
+                                EVP_MD_CTX *vctx = EVP_MD_CTX_new();
+                                int v_ok = 0;
+                                if (vctx && EVP_DigestVerifyInit(vctx, NULL, EVP_sha256(), NULL, server_pub) == 1 &&
+                                    EVP_DigestVerifyUpdate(vctx, server_signed1, server_signed1_len) == 1 &&
+                                    EVP_DigestVerifyFinal(vctx, der_sig, der_sig_len) == 1) {
+                                    v_ok = 1;
+                                }
+                                EVP_MD_CTX_free(vctx);
+                                EVP_PKEY_free(server_pub);
+                                OPENSSL_free(der_sig);
+                                X509_free(server_x509);
+                                if (!v_ok) {
+                                    if (g_ctx.config.debug_mode) printf("AuthenticateServer: Server signature verification failed\n");
+                                    apdu_response[0] = 0x69; apdu_response[1] = 0x82; // Security status not satisfied
+                                    response_len = 2; goto auth_cleanup;
+                                }
+                                if (g_ctx.config.debug_mode) printf("AuthenticateServer: Server signature verified\n");
+                                
+                                // Minimal parse of serverSigned1 to extract transactionId and serverChallenge
+                                // serverSigned1 is a SEQUENCE; search for [0]=0x80 (transactionId) and [4]=0x84 (serverChallenge)
+                                uint8_t tid_buf[32] = {0}; size_t tid_len = 0; uint8_t srv_chal[V_EUICC_CHALLENGE_LENGTH] = {0};
+                                const uint8_t *q = server_signed1; size_t qlen = server_signed1_len;
+                                // if it's wrapped in 0x30, skip header
+                                if (qlen >= 2 && q[0] == 0x30) {
+                                    size_t l=0, ll=0; if (asn1_decode_len_local(q+1, qlen-1, &l, &ll)==0 && 1+ll+l<=qlen) { q+=1+ll; qlen=l; }
+                                }
+                                size_t off = 0;
+                                while (off + 2 <= qlen) {
+                                    uint8_t t = q[off]; size_t l=0,ll=0; if (asn1_decode_len_local(q+off+1, qlen-(off+1), &l, &ll)!=0) break;
+                                    const uint8_t *val = q + off + 1 + ll;
+                                    if (t == 0x80 && tid_len == 0 && (off + 1 + ll + l) <= qlen) { // [0] transactionId
+                                        tid_len = l > sizeof(tid_buf) ? sizeof(tid_buf) : l;
+                                        memcpy(tid_buf, val, tid_len);
+                                    } else if (t == 0x84 && l == V_EUICC_CHALLENGE_LENGTH && (off + 1 + ll + l) <= qlen) { // [4] serverChallenge
+                                        memcpy(srv_chal, val, V_EUICC_CHALLENGE_LENGTH);
+                                    }
+                                    off += 1 + ll + l;
+                                }
+                                if (tid_len == 0) { // fallback
+                                    tid_buf[0]=0x01; tid_len=1;
+                                }
                                 
                                 // Store in crypto context
-                                memcpy(g_crypto_ctx.transaction_id, dummy_transaction_id, sizeof(dummy_transaction_id));
-                                g_crypto_ctx.transaction_id_length = sizeof(dummy_transaction_id);
-                                memcpy(g_crypto_ctx.server_challenge, dummy_server_challenge, V_EUICC_CHALLENGE_LENGTH);
+                                memcpy(g_crypto_ctx.transaction_id, tid_buf, tid_len);
+                                g_crypto_ctx.transaction_id_length = tid_len;
+                                memcpy(g_crypto_ctx.server_challenge, srv_chal, V_EUICC_CHALLENGE_LENGTH);
                                 
                                 // Create ECDSA-signed AuthenticateServerResponse
                                 uint8_t *auth_response_data = NULL;
@@ -448,6 +528,7 @@ static int handle_client_message(int client_fd, struct v_euicc_message *message)
                                     response_len = 2;
                                 }
                                 
+auth_cleanup:
                                 // Clean up parsed data
                                 free(server_signed1);
                                 free(server_signature1);

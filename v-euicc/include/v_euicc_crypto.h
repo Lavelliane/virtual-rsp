@@ -45,6 +45,16 @@ int v_euicc_ecdsa_verify(const struct v_euicc_certificate *cert,
                          const uint8_t *data, size_t data_len,
                          const uint8_t *signature, size_t signature_len);
 
+// ECDSA helpers for GSMA/GP TR-03111 raw r||s signatures
+// Sign and return 64-byte TR-03111 (r||s) signature
+int v_euicc_ecdsa_sign_tr03111(const struct v_euicc_certificate *cert,
+                               const uint8_t *data, size_t data_len,
+                               uint8_t *signature_out, size_t *signature_out_len);
+
+// Convert 64-byte TR-03111 (r||s) signature to DER-encoded ECDSA signature
+int v_euicc_tr03111_to_der(const uint8_t *tr_sig, size_t tr_sig_len,
+                           uint8_t **der_sig, size_t *der_sig_len);
+
 int v_euicc_generate_challenge(uint8_t *challenge);
 
 // ASN.1 helper functions

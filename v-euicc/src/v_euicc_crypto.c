@@ -10,6 +10,7 @@
 #include <openssl/sha.h>
 #include <openssl/rand.h>
 #include <openssl/err.h>
+#include <openssl/asn1.h>
 
 // Initialize crypto context
 int v_euicc_crypto_init(struct v_euicc_ecdsa_context *ctx, const char *certs_dir) {
@@ -260,6 +261,60 @@ int v_euicc_ecdsa_verify(const struct v_euicc_certificate *cert,
     return (result == 1) ? 0 : -1;
 }
 
+// Convert DER ECDSA Sig -> TR-03111 r||s helper
+static int v_euicc_der_to_tr03111(const uint8_t *der_sig, size_t der_len,
+                                  uint8_t *out64) {
+    const unsigned char *p = der_sig;
+    ECDSA_SIG *sig = d2i_ECDSA_SIG(NULL, &p, (long)der_len);
+    if (!sig) return -1;
+    const BIGNUM *r = NULL, *s = NULL;
+    ECDSA_SIG_get0(sig, &r, &s);
+    if (!r || !s) { ECDSA_SIG_free(sig); return -1; }
+    int r_len = BN_num_bytes(r);
+    int s_len = BN_num_bytes(s);
+    if (r_len > 32 || s_len > 32) { ECDSA_SIG_free(sig); return -1; }
+    memset(out64, 0, 64);
+    BN_bn2binpad(r, out64, 32);
+    BN_bn2binpad(s, out64 + 32, 32);
+    ECDSA_SIG_free(sig);
+    return 0;
+}
+
+int v_euicc_tr03111_to_der(const uint8_t *tr_sig, size_t tr_sig_len,
+                           uint8_t **der_sig, size_t *der_sig_len) {
+    if (!tr_sig || tr_sig_len != 64 || !der_sig || !der_sig_len) return -1;
+    BIGNUM *r = BN_bin2bn(tr_sig, 32, NULL);
+    BIGNUM *s = BN_bin2bn(tr_sig + 32, 32, NULL);
+    if (!r || !s) { BN_free(r); BN_free(s); return -1; }
+    ECDSA_SIG *sig = ECDSA_SIG_new();
+    if (!sig) { BN_free(r); BN_free(s); return -1; }
+    if (ECDSA_SIG_set0(sig, r, s) != 1) { ECDSA_SIG_free(sig); BN_free(r); BN_free(s); return -1; }
+    int len = i2d_ECDSA_SIG(sig, NULL);
+    if (len <= 0) { ECDSA_SIG_free(sig); return -1; }
+    *der_sig = (uint8_t *)OPENSSL_malloc(len);
+    if (!*der_sig) { ECDSA_SIG_free(sig); return -1; }
+    unsigned char *p = *der_sig;
+    len = i2d_ECDSA_SIG(sig, &p);
+    if (len <= 0) { OPENSSL_free(*der_sig); *der_sig = NULL; ECDSA_SIG_free(sig); return -1; }
+    *der_sig_len = (size_t)len;
+    ECDSA_SIG_free(sig);
+    return 0;
+}
+
+int v_euicc_ecdsa_sign_tr03111(const struct v_euicc_certificate *cert,
+                               const uint8_t *data, size_t data_len,
+                               uint8_t *signature_out, size_t *signature_out_len) {
+    if (!signature_out_len || *signature_out_len < 64) return -1;
+    uint8_t der_sig[V_EUICC_MAX_SIGNATURE_SIZE];
+    size_t der_len = sizeof(der_sig);
+    // Sign (DER)
+    if (v_euicc_ecdsa_sign(cert, data, data_len, der_sig, &der_len) != 0) return -1;
+    // Convert to TR-03111
+    if (v_euicc_der_to_tr03111(der_sig, der_len, signature_out) != 0) return -1;
+    *signature_out_len = 64;
+    return 0;
+}
+
 int v_euicc_generate_challenge(uint8_t *challenge) {
     if (!challenge) return -1;
     
@@ -382,10 +437,10 @@ int v_euicc_create_authenticate_server_response(const struct v_euicc_ecdsa_conte
     euicc_signed1[length_pos] = pos - length_pos - 1;
     
     // Sign euiccSigned1
-    uint8_t signature[V_EUICC_MAX_SIGNATURE_SIZE];
-    size_t signature_len = V_EUICC_MAX_SIGNATURE_SIZE;
-    
-    if (v_euicc_ecdsa_sign(&ctx->euicc_cert, euicc_signed1, pos, signature, &signature_len) != 0) {
+    uint8_t signature[64];
+    size_t signature_len = sizeof(signature);
+    // SGP.22 / GP requires TR-03111 r||s signature format
+    if (v_euicc_ecdsa_sign_tr03111(&ctx->euicc_cert, euicc_signed1, pos, signature, &signature_len) != 0) {
         free(euicc_signed1);
         return -1;
     }
@@ -415,7 +470,7 @@ int v_euicc_create_authenticate_server_response(const struct v_euicc_ecdsa_conte
     // euiccSignature1 [APPLICATION 55]
     auth_response[resp_pos++] = 0x5F;
     auth_response[resp_pos++] = 0x37;
-    auth_response[resp_pos++] = signature_len;
+    auth_response[resp_pos++] = (uint8_t)signature_len; // 64
     memcpy(auth_response + resp_pos, signature, signature_len);
     resp_pos += signature_len;
     
@@ -443,40 +498,97 @@ int v_euicc_create_authenticate_server_response(const struct v_euicc_ecdsa_conte
     return 0;
 }
 
+// Helper to decode ASN.1 length (short and long form). Returns bytes consumed in *len_len
+static int asn1_decode_len(const uint8_t *buf, size_t buf_len, size_t *len_out, size_t *len_len) {
+    if (buf_len == 0) return -1;
+    uint8_t b0 = buf[0];
+    if ((b0 & 0x80) == 0) {
+        *len_out = b0;
+        *len_len = 1;
+        return 0;
+    }
+    size_t num = (size_t)(b0 & 0x7F);
+    if (num == 0 || num > sizeof(size_t) || 1 + num > buf_len) return -1;
+    size_t len = 0;
+    for (size_t i = 0; i < num; i++) {
+        len = (len << 8) | buf[1 + i];
+    }
+    *len_out = len;
+    *len_len = 1 + num;
+    return 0;
+}
+
 // Basic ASN.1 parsing for AuthenticateServer request
 int v_euicc_parse_authenticate_server_request(const uint8_t *apdu_data, size_t data_len,
                                               uint8_t **server_signed1, size_t *server_signed1_len,
                                               uint8_t **server_signature1, size_t *server_signature1_len,
                                               uint8_t **euicc_ci_pkid, size_t *euicc_ci_pkid_len,
                                               uint8_t **server_certificate, size_t *server_certificate_len) {
-    // Simplified ASN.1 parsing - in a real implementation, use a proper ASN.1 library
-    // For now, we'll extract the basic structure
-    
-    if (!apdu_data || data_len < 10) return -1;
-    
-    // Look for BF38 tag (AuthenticateServerRequest)
-    for (size_t i = 0; i < data_len - 2; i++) {
-        if (apdu_data[i] == 0xBF && apdu_data[i + 1] == 0x38) {
-            // Found the tag, parse the content
-            size_t content_len = apdu_data[i + 2];
-            const uint8_t *content = apdu_data + i + 3;
-            
-            // For now, return dummy data indicating we found the structure
-            if (server_signed1 && server_signed1_len) {
-                *server_signed1_len = 32; // dummy
-                *server_signed1 = malloc(32);
-                memset(*server_signed1, 0xAA, 32);
-            }
-            
-            if (server_signature1 && server_signature1_len) {
-                *server_signature1_len = 64; // dummy
-                *server_signature1 = malloc(64);
-                memset(*server_signature1, 0xBB, 64);
-            }
-            
-            return 0;
-        }
+    if (!apdu_data || data_len < 4) return -1;
+
+    // locate BF38
+    size_t i = 0;
+    while (i + 2 < data_len) {
+        if (apdu_data[i] == 0xBF && apdu_data[i+1] == 0x38) break;
+        i++;
     }
-    
-    return -1;
-} 
+    if (i + 2 >= data_len) return -1;
+    size_t len_len = 0, content_len = 0;
+    if (asn1_decode_len(apdu_data + i + 2, data_len - (i + 2), &content_len, &len_len) != 0) return -1;
+    size_t content_off = i + 2 + len_len;
+    if (content_off + content_len > data_len) return -1;
+
+    const uint8_t *p = apdu_data + content_off;
+    size_t rem = content_len;
+
+    // Expected order: 0x30 serverSigned1, 0x5F 0x37 signature, 0x04 euiccCiPKIdToBeUsed, 0x30 serverCertificate
+    // Parse sequentially but tolerate extra fields
+    while (rem >= 2) {
+        uint8_t tag0 = p[0];
+        if (rem < 2) break;
+        size_t tl_len_len = 0, tl_len = 0;
+        if (asn1_decode_len(p + 1, rem - 1, &tl_len, &tl_len_len) != 0) return -1;
+        size_t tl_tot = 1 + tl_len_len + tl_len;
+        if (tl_tot > rem) return -1;
+
+        if (tag0 == 0x30 && server_signed1 && server_signed1_len && *server_signed1 == NULL) {
+            *server_signed1 = (uint8_t *)malloc(tl_tot);
+            if (!*server_signed1) return -1;
+            memcpy(*server_signed1, p, tl_tot);
+            *server_signed1_len = tl_tot;
+        } else if (tag0 == 0x5F && rem >= 3 && p[1] == 0x37) {
+            // 5F 37 L <sig>
+            size_t sig_len_len = 0, sig_len = 0;
+            if (asn1_decode_len(p + 2, rem - 2, &sig_len, &sig_len_len) != 0) return -1;
+            if (2 + sig_len_len + sig_len > rem) return -1;
+            if (server_signature1 && server_signature1_len && *server_signature1 == NULL) {
+                *server_signature1 = (uint8_t *)malloc(sig_len);
+                if (!*server_signature1) return -1;
+                memcpy(*server_signature1, p + 2 + sig_len_len, sig_len);
+                *server_signature1_len = sig_len;
+            }
+        } else if (tag0 == 0x04 && euicc_ci_pkid && euicc_ci_pkid_len && *euicc_ci_pkid == NULL) {
+            // OCTET STRING (expected 20 bytes)
+            const uint8_t *val = p + 1 + tl_len_len;
+            if (1 + tl_len_len + tl_len > rem) return -1;
+            *euicc_ci_pkid = (uint8_t *)malloc(tl_len);
+            if (!*euicc_ci_pkid) return -1;
+            memcpy(*euicc_ci_pkid, val, tl_len);
+            *euicc_ci_pkid_len = tl_len;
+        } else if (tag0 == 0x30 && server_certificate && server_certificate_len && *server_certificate == NULL && *server_signed1 != NULL) {
+            // Heuristic: first 0x30 we saw was serverSigned1; the next standalone 0x30 big object we assume is X.509
+            *server_certificate = (uint8_t *)malloc(tl_tot);
+            if (!*server_certificate) return -1;
+            memcpy(*server_certificate, p, tl_tot);
+            *server_certificate_len = tl_tot;
+        }
+
+        p += tl_tot;
+        rem -= tl_tot;
+    }
+
+    // minimally require serverSigned1, signature and serverCertificate
+    if (!server_signed1 || !server_signature1 || !server_certificate) return -1;
+    if (!*server_signed1 || !*server_signature1 || !*server_certificate) return -1;
+    return 0;
+}
